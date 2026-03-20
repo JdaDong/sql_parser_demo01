@@ -20,3 +20,8 @@ project/plugins/project/
 
 # Mac
 .DS_Store
+
+.bloop
+.idea
+.bsp
+.codebuddy
