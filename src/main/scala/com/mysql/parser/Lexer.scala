@@ -4,10 +4,18 @@ import scala.util.matching.Regex
 
 /**
  * 词法分析器 - 将 SQL 字符串转换为 Token 流
+ *
+ * 支持两种模式：
+ *   - tokenize()             返回 List[Token]（原有行为，向后兼容）
+ *   - tokenizeWithPositions() 返回 List[PositionedToken]（携带行号/列号）
  */
 class Lexer(input: String) {
   private var position = 0
   private val length = input.length
+
+  // 行号/列号跟踪
+  private var line = 1
+  private var column = 1
 
   // 关键字映射
   private val keywords = Map(
@@ -55,6 +63,8 @@ class Lexer(input: String) {
     "END" -> END,
     "UNION" -> UNION,
     "ALL" -> ALL,
+    "INTERSECT" -> INTERSECT,
+    "EXCEPT" -> EXCEPT,
     "CAST" -> CAST,
     "CONVERT" -> CONVERT,
     "SIGNED" -> SIGNED,
@@ -74,24 +84,114 @@ class Lexer(input: String) {
     "TEXT" -> TEXT,
     "DATETIME" -> DATETIME,
     "TIMESTAMP" -> TIMESTAMP,
-    "BOOLEAN" -> BOOLEAN
+    "BOOLEAN" -> BOOLEAN,
+    // 窗口函数关键字
+    "OVER" -> OVER,
+    "PARTITION" -> PARTITION,
+    "ROWS" -> ROWS,
+    "RANGE" -> RANGE,
+    "UNBOUNDED" -> UNBOUNDED,
+    "PRECEDING" -> PRECEDING,
+    "FOLLOWING" -> FOLLOWING,
+    "CURRENT" -> CURRENT,
+    "ROW" -> ROW,
+    // CTE 关键字
+    "WITH" -> WITH,
+    "RECURSIVE" -> RECURSIVE,
+    // ALTER TABLE 关键字
+    "ADD" -> ADD,
+    "COLUMN" -> COLUMN_KW,
+    "MODIFY" -> MODIFY,
+    "RENAME" -> RENAME,
+    "TO" -> TO,
+    "CHANGE" -> CHANGE,
+    "IF" -> IF,
+    // 约束关键字
+    "PRIMARY" -> PRIMARY,
+    "KEY" -> KEY,
+    "UNIQUE" -> UNIQUE,
+    "FOREIGN" -> FOREIGN,
+    "REFERENCES" -> REFERENCES,
+    "CHECK" -> CHECK,
+    "DEFAULT" -> DEFAULT,
+    "AUTO_INCREMENT" -> AUTO_INCREMENT,
+    "CONSTRAINT" -> CONSTRAINT,
+    // 索引关键字
+    "INDEX" -> INDEX,
+    // 视图关键字
+    "VIEW" -> VIEW,
+    "REPLACE" -> REPLACE,
+    // 存储过程关键字
+    "PROCEDURE" -> PROCEDURE,
+    "CALL" -> CALL,
+    "BEGIN" -> BEGIN_KW,
+    "RETURN" -> RETURN,
+    "INOUT" -> INOUT,
+    "OUT" -> OUT,
+    // 新增数据类型
+    "BIGINT" -> BIGINT,
+    "SMALLINT" -> SMALLINT,
+    "FLOAT" -> FLOAT,
+    "DOUBLE" -> DOUBLE
   )
 
   /**
-   * 获取所有 Token
+   * 获取所有 Token（向后兼容，不带位置信息）
    */
   def tokenize(): List[Token] = {
-    var tokens = List[Token]()
-    var token = nextToken()
+    tokenizeWithPositions().map(_.token)
+  }
+
+  /**
+   * 获取所有 Token（携带位置信息）
+   */
+  def tokenizeWithPositions(): List[PositionedToken] = {
+    var tokens = List[PositionedToken]()
+    var pt = nextPositionedToken()
     
-    while (token != EOF) {
-      if (token != WHITESPACE) {
-        tokens = tokens :+ token
+    while (pt.token != EOF) {
+      if (pt.token != WHITESPACE) {
+        tokens = tokens :+ pt
       }
-      token = nextToken()
+      pt = nextPositionedToken()
     }
     
-    tokens :+ EOF
+    tokens :+ pt  // 追加 EOF（也带位置）
+  }
+
+  /**
+   * 获取下一个 PositionedToken（记录起始位置后调用 nextToken）
+   */
+  private def nextPositionedToken(): PositionedToken = {
+    val pos = Position(line, column, position)
+    val token = nextToken()
+    PositionedToken(token, pos)
+  }
+
+  /**
+   * 前进一个字符并更新行号/列号
+   */
+  private def advance(): Char = {
+    val ch = input.charAt(position)
+    if (ch == '\n') {
+      line += 1
+      column = 1
+    } else {
+      column += 1
+    }
+    position += 1
+    ch
+  }
+
+  /**
+   * 前进 n 个字符并更新行号/列号
+   */
+  private def advanceN(n: Int): Unit = {
+    var i = 0
+    while (i < n && position < length) {
+      advance()
+      i += 1
+    }
   }
 
   /**
@@ -104,7 +204,24 @@ class Lexer(input: String) {
 
     // 跳过空白字符
     if (currentChar.isWhitespace) {
-      position += 1
+      advance()
+      return WHITESPACE
+    }
+
+    // 跳过注释
+    // 单行注释: -- ...
+    if (currentChar == '-' && peek() == '-') {
+      skipLineComment()
+      return WHITESPACE
+    }
+    // 单行注释: # ...（MySQL 特有）
+    if (currentChar == '#') {
+      skipLineComment()
+      return WHITESPACE
+    }
+    // 块注释: /* ... */
+    if (currentChar == '/' && peek() == '*') {
+      skipBlockComment()
       return WHITESPACE
     }
 
@@ -126,61 +243,65 @@ class Lexer(input: String) {
     // 识别运算符和分隔符
     currentChar match {
       case '=' =>
-        position += 1
+        advance()
         EQUALS
       case '!' =>
         if (peek() == '=') {
-          position += 2
+          advanceN(2)
           NOT_EQUALS
         } else {
-          position += 1
+          advance()
           NOT
         }
       case '<' =>
         if (peek() == '=') {
-          position += 2
+          advanceN(2)
           LESS_EQUAL
         } else {
-          position += 1
+          advance()
           LESS_THAN
         }
       case '>' =>
         if (peek() == '=') {
-          position += 2
+          advanceN(2)
           GREATER_EQUAL
         } else {
-          position += 1
+          advance()
           GREATER_THAN
         }
       case '+' =>
-        position += 1
+        advance()
         PLUS_OP
       case '-' =>
-        position += 1
+        advance()
         MINUS_OP
       case '*' =>
-        position += 1
+        advance()
         MULTIPLY_OP
       case '/' =>
-        position += 1
+        advance()
         DIVIDE_OP
       case '(' =>
-        position += 1
+        advance()
         LPAREN
       case ')' =>
-        position += 1
+        advance()
         RPAREN
       case ',' =>
-        position += 1
+        advance()
         COMMA
       case ';' =>
-        position += 1
+        advance()
         SEMICOLON
       case '.' =>
-        position += 1
+        advance()
         DOT
       case _ =>
-        throw new RuntimeException(s"Unexpected character: $currentChar at position $position")
+        throw new ParseException(
+          s"Unexpected character: '$currentChar'",
+          Position(line, column, position),
+          input
+        )
     }
   }
 
@@ -190,7 +311,7 @@ class Lexer(input: String) {
   private def readNumber(): Token = {
     val start = position
     while (position < length && (input.charAt(position).isDigit || input.charAt(position) == '.')) {
-      position += 1
+      advance()
     }
     NumberToken(input.substring(start, position))
   }
@@ -201,34 +322,38 @@ class Lexer(input: String) {
   private def readIdentifier(): Token = {
     val start = position
     while (position < length && (input.charAt(position).isLetterOrDigit || input.charAt(position) == '_')) {
-      position += 1
+      advance()
     }
     val text = input.substring(start, position)
     val upperText = text.toUpperCase
-    keywords.getOrElse(upperText, IdentifierToken(text))
+    keywords.getOrElse(upperText, IdentifierToken(upperText))
   }
 
   /**
    * 读取字符串字面量
    */
   private def readString(quote: Char): Token = {
-    position += 1 // 跳过开始引号
+    advance() // 跳过开始引号
     val start = position
     
     while (position < length && input.charAt(position) != quote) {
       if (input.charAt(position) == '\\' && position + 1 < length) {
-        position += 2 // 跳过转义字符
+        advanceN(2) // 跳过转义字符
       } else {
-        position += 1
+        advance()
       }
     }
     
     if (position >= length) {
-      throw new RuntimeException("Unterminated string literal")
+      throw new ParseException(
+        "Unterminated string literal",
+        Position(line, column, position),
+        input
+      )
     }
     
     val value = input.substring(start, position)
-    position += 1 // 跳过结束引号
+    advance() // 跳过结束引号
     StringToken(value)
   }
 
@@ -238,6 +363,37 @@ class Lexer(input: String) {
   private def peek(): Char = {
     if (position + 1 < length) input.charAt(position + 1)
     else '\u0000'
+  }
+
+  /**
+   * 跳过单行注释（-- 或 #）
+   * 从当前位置一直跳到行尾（不含换行符，换行符由下一轮 WHITESPACE 处理）
+   */
+  private def skipLineComment(): Unit = {
+    while (position < length && input.charAt(position) != '\n') {
+      advance()
+    }
+  }
+
+  /**
+   * 跳过块注释 /* ... */
+   * 支持嵌套检测（发现未闭合的块注释抛出异常）
+   */
+  private def skipBlockComment(): Unit = {
+    val startPos = Position(line, column, position)
+    advanceN(2) // 跳过 /*
+    while (position + 1 < length) {
+      if (input.charAt(position) == '*' && input.charAt(position + 1) == '/') {
+        advanceN(2) // 跳过 */
+        return
+      }
+      advance()
+    }
+    throw new ParseException(
+      "Unterminated block comment",
+      startPos,
+      input
+    )
   }
 }
 

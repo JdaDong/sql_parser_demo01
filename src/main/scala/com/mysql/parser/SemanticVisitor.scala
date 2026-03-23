@@ -270,6 +270,15 @@ class ColumnExistenceVisitor(schema: DatabaseSchema)
       case ExistsExpression(_, _) => zero
       case InSubqueryExpression(expression, _, _) =>
         checkExpression(expression, scope)
+      case WindowFunctionExpression(function, windowSpec) =>
+        val funcErrors = checkExpression(function, scope)
+        val partErrors = windowSpec.partitionBy.map(exprs =>
+          combineAll(exprs.map(e => checkExpression(e, scope)))
+        ).getOrElse(zero)
+        val orderErrors = windowSpec.orderBy.map(obs =>
+          combineAll(obs.map(ob => checkExpression(ob.expression, scope)))
+        ).getOrElse(zero)
+        combineAll(List(funcErrors, partErrors, orderErrors))
       case _: StringLiteral | _: NumberLiteral | NullLiteral | AllColumnsExpression => zero
     }
   }
@@ -414,11 +423,11 @@ class InsertValidationVisitor(schema: DatabaseSchema)
 
 
 // ============================================================
-//  7. UNION 列数一致性检查 Visitor
+//  7. 集合运算列数一致性检查 Visitor（UNION / INTERSECT / EXCEPT）
 // ============================================================
 
 /**
- * 检查 UNION 两侧 SELECT 的列数是否一致
+ * 检查集合运算两侧 SELECT 的列数是否一致
  */
 class UnionColumnCountVisitor(schema: DatabaseSchema)
   extends SemanticBaseVisitor(schema) {
@@ -432,8 +441,9 @@ class UnionColumnCountVisitor(schema: DatabaseSchema)
     val rightCount = stmt.right.columns.length
 
     val myErrors = if (leftCount > 0 && rightCount > 0 && leftCount != rightCount) {
+      val opName = setOperatorName(stmt.unionType)
       error(
-        s"UNION queries must have the same number of columns (left: ${leftCount}, right: ${rightCount})",
+        s"$opName queries must have the same number of columns (left: ${leftCount}, right: ${rightCount})",
         "UNION"
       )
     } else zero
@@ -446,6 +456,13 @@ class UnionColumnCountVisitor(schema: DatabaseSchema)
     case u: UnionStatement  => countColumns(u.left)
     case _ => 0
   }
+
+  /** 获取集合运算符的显示名称 */
+  private def setOperatorName(ut: UnionType): String = ut match {
+    case UnionAll | UnionDistinct       => "UNION"
+    case IntersectAll | IntersectDistinct => "INTERSECT"
+    case ExceptAll | ExceptDistinct     => "EXCEPT"
+  }
 }
 
 
@@ -454,9 +471,12 @@ class UnionColumnCountVisitor(schema: DatabaseSchema)
 // ============================================================
 
 /**
- * 检查 CREATE TABLE 和 DROP TABLE 的语义
+ * 检查 DDL 语句的语义
  *   - CREATE TABLE：表是否已存在 + 列名是否重复
  *   - DROP TABLE：表是否存在
+ *   - ALTER TABLE：表是否存在 + 列操作合法性
+ *   - CREATE INDEX：表和列是否存在
+ *   - DROP INDEX：表是否存在
  */
 class DDLValidationVisitor(schema: DatabaseSchema)
   extends SemanticBaseVisitor(schema) {
@@ -480,6 +500,62 @@ class DDLValidationVisitor(schema: DatabaseSchema)
   }
 
   override def visitDropTableStatement(stmt: DropTableStatement): List[SemanticError] = {
+    if (!schema.hasTable(stmt.tableName)) {
+      error(s"Table '${stmt.tableName}' does not exist", "TABLE")
+    } else zero
+  }
+
+  override def visitAlterTableStatement(stmt: AlterTableStatement): List[SemanticError] = {
+    var errors = List[SemanticError]()
+
+    if (!schema.hasTable(stmt.tableName)) {
+      errors = errors ++ error(s"Table '${stmt.tableName}' does not exist", "TABLE")
+    } else {
+      schema.findTable(stmt.tableName).foreach { table =>
+        stmt.actions.foreach {
+          case AddColumnAction(col) =>
+            if (table.hasColumn(col.name)) {
+              errors = errors ++ error(s"Column '${col.name}' already exists in table '${stmt.tableName}'", "COLUMN")
+            }
+          case DropColumnAction(colName) =>
+            if (!table.hasColumn(colName)) {
+              errors = errors ++ error(s"Column '${colName}' does not exist in table '${stmt.tableName}'", "COLUMN")
+            }
+          case ModifyColumnAction(col) =>
+            if (!table.hasColumn(col.name)) {
+              errors = errors ++ error(s"Column '${col.name}' does not exist in table '${stmt.tableName}'", "COLUMN")
+            }
+          case ChangeColumnAction(oldName, _) =>
+            if (!table.hasColumn(oldName)) {
+              errors = errors ++ error(s"Column '${oldName}' does not exist in table '${stmt.tableName}'", "COLUMN")
+            }
+          case _ => // RENAME, ADD CONSTRAINT, DROP CONSTRAINT
+        }
+      }
+    }
+
+    errors
+  }
+
+  override def visitCreateIndexStatement(stmt: CreateIndexStatement): List[SemanticError] = {
+    var errors = List[SemanticError]()
+
+    if (!schema.hasTable(stmt.tableName)) {
+      errors = errors ++ error(s"Table '${stmt.tableName}' does not exist", "TABLE")
+    } else {
+      schema.findTable(stmt.tableName).foreach { table =>
+        stmt.columns.foreach { col =>
+          if (!table.hasColumn(col.name)) {
+            errors = errors ++ error(s"Column '${col.name}' does not exist in table '${stmt.tableName}'", "COLUMN")
+          }
+        }
+      }
+    }
+
+    errors
+  }
+
+  override def visitDropIndexStatement(stmt: DropIndexStatement): List[SemanticError] = {
     if (!schema.hasTable(stmt.tableName)) {
       error(s"Table '${stmt.tableName}' does not exist", "TABLE")
     } else zero
@@ -601,6 +677,10 @@ object ExpressionHelper {
       extractIdentifiers(expression) ++ values.flatMap(extractIdentifiers)
     case LikeExpression(expression, pattern, _) =>
       extractIdentifiers(expression) ++ extractIdentifiers(pattern)
+    case WindowFunctionExpression(function, windowSpec) =>
+      extractIdentifiers(function) ++
+        windowSpec.partitionBy.toList.flatMap(_.flatMap(extractIdentifiers)) ++
+        windowSpec.orderBy.toList.flatMap(_.flatMap(ob => extractIdentifiers(ob.expression)))
     case _ => List.empty
   }
 
@@ -630,6 +710,7 @@ object ExpressionHelper {
       extractNonAggregateIdentifiers(expression) ++ values.flatMap(extractNonAggregateIdentifiers)
     case LikeExpression(expression, pattern, _) =>
       extractNonAggregateIdentifiers(expression) ++ extractNonAggregateIdentifiers(pattern)
+    case _: WindowFunctionExpression => List.empty  // 窗口函数内的不算
     case _ => List.empty
   }
 
@@ -650,6 +731,7 @@ object ExpressionHelper {
         elseResult.exists(containsAggregateFunction)
     case CastExpression(expression, _) => containsAggregateFunction(expression)
     case ConvertExpression(expression, _, _) => containsAggregateFunction(expression)
+    case _: WindowFunctionExpression => true  // 窗口函数视为含聚合
     case _ => false
   }
 }
@@ -696,7 +778,8 @@ class SemanticVisitorPipeline(
       new HavingConsistencyVisitor(schema),
       new InsertValidationVisitor(schema),
       new UnionColumnCountVisitor(schema),
-      new DDLValidationVisitor(schema)
+      new DDLValidationVisitor(schema),
+      new TypeCheckVisitor(schema)
     )
 
   /**

@@ -50,6 +50,15 @@ trait ASTVisitor[R] {
     case c: CreateTableStatement => visitCreateTableStatement(c)
     case dt: DropTableStatement  => visitDropTableStatement(dt)
     case un: UnionStatement      => visitUnionStatement(un)
+    case w: WithStatement        => visitWithStatement(w)
+    case a: AlterTableStatement  => visitAlterTableStatement(a)
+    case ci: CreateIndexStatement => visitCreateIndexStatement(ci)
+    case di: DropIndexStatement  => visitDropIndexStatement(di)
+    case cv: CreateViewStatement => visitCreateViewStatement(cv)
+    case dv: DropViewStatement   => visitDropViewStatement(dv)
+    case cp: CreateProcedureStatement => visitCreateProcedureStatement(cp)
+    case dp: DropProcedureStatement   => visitDropProcedureStatement(dp)
+    case cs: CallStatement       => visitCallStatement(cs)
   }
 
   def visitSelectStatement(stmt: SelectStatement): R = {
@@ -81,8 +90,34 @@ trait ASTVisitor[R] {
 
   def visitDropTableStatement(stmt: DropTableStatement): R = zero
 
+  def visitAlterTableStatement(stmt: AlterTableStatement): R = zero
+
+  def visitCreateIndexStatement(stmt: CreateIndexStatement): R = zero
+
+  def visitDropIndexStatement(stmt: DropIndexStatement): R = zero
+
+  def visitCreateViewStatement(stmt: CreateViewStatement): R = visitStatement(stmt.query)
+
+  def visitDropViewStatement(stmt: DropViewStatement): R = zero
+
+  def visitCreateProcedureStatement(stmt: CreateProcedureStatement): R = {
+    combineAll(stmt.body.map(visitStatement))
+  }
+
+  def visitDropProcedureStatement(stmt: DropProcedureStatement): R = zero
+
+  def visitCallStatement(stmt: CallStatement): R = {
+    combineAll(stmt.arguments.map(visitExpression))
+  }
+
   def visitUnionStatement(stmt: UnionStatement): R = {
     combine(visitStatement(stmt.left), visitSelectStatement(stmt.right))
+  }
+
+  def visitWithStatement(stmt: WithStatement): R = {
+    val cteResults = combineAll(stmt.ctes.map(cte => visitStatement(cte.query)))
+    val queryResult = visitStatement(stmt.query)
+    combine(cteResults, queryResult)
   }
 
   // ====== 列级 ======
@@ -144,6 +179,7 @@ trait ASTVisitor[R] {
     case sq: SubqueryExpression  => visitSubqueryExpression(sq)
     case ex: ExistsExpression    => visitExistsExpression(ex)
     case isq: InSubqueryExpression => visitInSubqueryExpression(isq)
+    case wf: WindowFunctionExpression => visitWindowFunctionExpression(wf)
   }
 
   def visitIdentifier(expr: Identifier): R = zero
@@ -200,6 +236,17 @@ trait ASTVisitor[R] {
 
   def visitInSubqueryExpression(expr: InSubqueryExpression): R =
     combine(visitExpression(expr.expression), visitStatement(expr.query))
+
+  def visitWindowFunctionExpression(expr: WindowFunctionExpression): R = {
+    val funcResult = visitExpression(expr.function)
+    val partitionResult = expr.windowSpec.partitionBy
+      .map(exprs => combineAll(exprs.map(visitExpression)))
+      .getOrElse(zero)
+    val orderByResult = expr.windowSpec.orderBy
+      .map(obs => combineAll(obs.map(ob => visitExpression(ob.expression))))
+      .getOrElse(zero)
+    combineAll(List(funcResult, partitionResult, orderByResult))
+  }
 }
 
 
@@ -228,6 +275,15 @@ trait ASTTransformer {
     case c: CreateTableStatement => transformCreateTableStatement(c)
     case dt: DropTableStatement  => transformDropTableStatement(dt)
     case un: UnionStatement      => transformUnionStatement(un)
+    case w: WithStatement        => transformWithStatement(w)
+    case a: AlterTableStatement  => transformAlterTableStatement(a)
+    case ci: CreateIndexStatement => transformCreateIndexStatement(ci)
+    case di: DropIndexStatement  => transformDropIndexStatement(di)
+    case cv: CreateViewStatement => transformCreateViewStatement(cv)
+    case dv: DropViewStatement   => transformDropViewStatement(dv)
+    case cp: CreateProcedureStatement => transformCreateProcedureStatement(cp)
+    case dp: DropProcedureStatement   => transformDropProcedureStatement(dp)
+    case cs: CallStatement       => transformCallStatement(cs)
   }
 
   def transformSelectStatement(stmt: SelectStatement): SelectStatement = {
@@ -278,6 +334,41 @@ trait ASTTransformer {
 
   def transformDropTableStatement(stmt: DropTableStatement): DropTableStatement = {
     DropTableStatement(
+      tableName = transformTableName(stmt.tableName),
+      ifExists = stmt.ifExists
+    )
+  }
+
+  def transformAlterTableStatement(stmt: AlterTableStatement): AlterTableStatement = {
+    AlterTableStatement(
+      tableName = transformTableName(stmt.tableName),
+      actions = stmt.actions.map(transformAlterAction)
+    )
+  }
+
+  def transformAlterAction(action: AlterAction): AlterAction = action match {
+    case AddColumnAction(col) => AddColumnAction(transformColumnDefinition(col))
+    case DropColumnAction(name) => DropColumnAction(transformColumnName(name))
+    case ModifyColumnAction(col) => ModifyColumnAction(transformColumnDefinition(col))
+    case ChangeColumnAction(oldName, newCol) =>
+      ChangeColumnAction(transformColumnName(oldName), transformColumnDefinition(newCol))
+    case RenameTableAction(newName) => RenameTableAction(newName)
+    case AddConstraintAction(constraint) => AddConstraintAction(constraint)
+    case dc: DropConstraintAction => dc
+  }
+
+  def transformCreateIndexStatement(stmt: CreateIndexStatement): CreateIndexStatement = {
+    CreateIndexStatement(
+      indexName = stmt.indexName,
+      tableName = transformTableName(stmt.tableName),
+      columns = stmt.columns,
+      unique = stmt.unique
+    )
+  }
+
+  def transformDropIndexStatement(stmt: DropIndexStatement): DropIndexStatement = {
+    DropIndexStatement(
+      indexName = stmt.indexName,
       tableName = transformTableName(stmt.tableName)
     )
   }
@@ -288,6 +379,30 @@ trait ASTTransformer {
       right = transformSelectStatement(stmt.right),
       unionType = stmt.unionType
     )
+  }
+
+  def transformWithStatement(stmt: WithStatement): WithStatement = {
+    WithStatement(
+      ctes = stmt.ctes.map(cte => CTEDefinition(cte.name, transformStatement(cte.query))),
+      query = transformStatement(stmt.query),
+      recursive = stmt.recursive
+    )
+  }
+
+  def transformCreateViewStatement(stmt: CreateViewStatement): CreateViewStatement = {
+    CreateViewStatement(stmt.viewName, transformStatement(stmt.query), stmt.orReplace)
+  }
+
+  def transformDropViewStatement(stmt: DropViewStatement): DropViewStatement = stmt
+
+  def transformCreateProcedureStatement(stmt: CreateProcedureStatement): CreateProcedureStatement = {
+    CreateProcedureStatement(stmt.name, stmt.params, stmt.body.map(transformStatement))
+  }
+
+  def transformDropProcedureStatement(stmt: DropProcedureStatement): DropProcedureStatement = stmt
+
+  def transformCallStatement(stmt: CallStatement): CallStatement = {
+    CallStatement(stmt.procedureName, stmt.arguments.map(transformExpression))
   }
 
   // ====== 列级 ======
@@ -364,6 +479,15 @@ trait ASTTransformer {
       ExistsExpression(transformStatement(query), negated)
     case InSubqueryExpression(expression, query, negated) =>
       InSubqueryExpression(transformExpression(expression), transformStatement(query), negated)
+    case WindowFunctionExpression(function, windowSpec) =>
+      WindowFunctionExpression(
+        transformExpression(function),
+        WindowSpec(
+          partitionBy = windowSpec.partitionBy.map(_.map(transformExpression)),
+          orderBy = windowSpec.orderBy.map(_.map(ob => OrderByClause(transformExpression(ob.expression), ob.ascending))),
+          frame = windowSpec.frame
+        )
+      )
   }
 
   // ====== 原子变换钩子（子类重写这些方法实现具体变换） ======
@@ -412,6 +536,18 @@ class TableExtractor extends ASTVisitor[List[String]] {
   }
 
   override def visitDropTableStatement(stmt: DropTableStatement): List[String] = {
+    List(stmt.tableName)
+  }
+
+  override def visitAlterTableStatement(stmt: AlterTableStatement): List[String] = {
+    List(stmt.tableName)
+  }
+
+  override def visitCreateIndexStatement(stmt: CreateIndexStatement): List[String] = {
+    List(stmt.tableName)
+  }
+
+  override def visitDropIndexStatement(stmt: DropIndexStatement): List[String] = {
     List(stmt.tableName)
   }
 }
@@ -471,6 +607,15 @@ class SQLPrettyPrinter extends ASTVisitor[String] {
     case c: CreateTableStatement => visitCreateTableStatement(c)
     case dt: DropTableStatement  => visitDropTableStatement(dt)
     case un: UnionStatement      => visitUnionStatement(un)
+    case w: WithStatement        => visitWithStatement(w)
+    case a: AlterTableStatement  => visitAlterTableStatement(a)
+    case ci: CreateIndexStatement => visitCreateIndexStatement(ci)
+    case di: DropIndexStatement  => visitDropIndexStatement(di)
+    case cv: CreateViewStatement => visitCreateViewStatement(cv)
+    case dv: DropViewStatement   => visitDropViewStatement(dv)
+    case cp: CreateProcedureStatement => visitCreateProcedureStatement(cp)
+    case dp: DropProcedureStatement   => visitDropProcedureStatement(dp)
+    case cs: CallStatement       => visitCallStatement(cs)
   }
 
   override def visitSelectStatement(stmt: SelectStatement): String = {
@@ -565,24 +710,108 @@ class SQLPrettyPrinter extends ASTVisitor[String] {
   }
 
   override def visitCreateTableStatement(stmt: CreateTableStatement): String = {
-    val colsStr = stmt.columns.map { col =>
-      s"$INDENT${col.name} ${formatDataType(col.dataType)}"
-    }.mkString(",\n")
-    s"CREATE TABLE ${stmt.tableName} (\n$colsStr\n)"
+    val items = new scala.collection.mutable.ListBuffer[String]()
+
+    // 列定义
+    stmt.columns.foreach { col =>
+      val constraintStr = formatColumnConstraints(col.constraints)
+      items += s"$INDENT${col.name} ${formatDataType(col.dataType)}$constraintStr"
+    }
+
+    // 表级约束
+    stmt.constraints.foreach { tc =>
+      items += s"$INDENT${formatTableConstraint(tc)}"
+    }
+
+    s"CREATE TABLE ${stmt.tableName} (\n${items.mkString(",\n")}\n)"
   }
 
   override def visitDropTableStatement(stmt: DropTableStatement): String = {
-    s"DROP TABLE ${stmt.tableName}"
+    val ifExistsStr = if (stmt.ifExists) " IF EXISTS" else ""
+    s"DROP TABLE$ifExistsStr ${stmt.tableName}"
+  }
+
+  override def visitAlterTableStatement(stmt: AlterTableStatement): String = {
+    val actionsStr = stmt.actions.map(formatAlterAction).mkString(",\n$INDENT")
+    s"ALTER TABLE ${stmt.tableName}\n$INDENT$actionsStr"
+  }
+
+  override def visitCreateIndexStatement(stmt: CreateIndexStatement): String = {
+    val uniqueStr = if (stmt.unique) "UNIQUE " else ""
+    val colsStr = stmt.columns.map { ic =>
+      s"${ic.name}${if (ic.ascending) "" else " DESC"}"
+    }.mkString(", ")
+    s"CREATE ${uniqueStr}INDEX ${stmt.indexName} ON ${stmt.tableName} ($colsStr)"
+  }
+
+  override def visitDropIndexStatement(stmt: DropIndexStatement): String = {
+    s"DROP INDEX ${stmt.indexName} ON ${stmt.tableName}"
   }
 
   override def visitUnionStatement(stmt: UnionStatement): String = {
     val leftStr = visitStatement(stmt.left)
     val rightStr = visitSelectStatement(stmt.right)
     val unionKeyword = stmt.unionType match {
-      case UnionAll      => "UNION ALL"
-      case UnionDistinct => "UNION"
+      case UnionAll          => "UNION ALL"
+      case UnionDistinct     => "UNION"
+      case IntersectAll      => "INTERSECT ALL"
+      case IntersectDistinct => "INTERSECT"
+      case ExceptAll         => "EXCEPT ALL"
+      case ExceptDistinct    => "EXCEPT"
     }
     s"$leftStr\n$unionKeyword\n$rightStr"
+  }
+
+  override def visitWithStatement(stmt: WithStatement): String = {
+    val parts = new scala.collection.mutable.ListBuffer[String]()
+
+    // WITH [RECURSIVE]
+    val withKeyword = if (stmt.recursive) "WITH RECURSIVE" else "WITH"
+
+    // CTE 定义
+    val cteStr = stmt.ctes.map { cte =>
+      s"${cte.name} AS (\n${visitStatement(cte.query)}\n)"
+    }.mkString(s",\n$INDENT")
+
+    parts += s"$withKeyword\n$INDENT$cteStr"
+
+    // 主查询
+    parts += visitStatement(stmt.query)
+
+    parts.mkString("\n")
+  }
+
+  override def visitCreateViewStatement(stmt: CreateViewStatement): String = {
+    val replaceStr = if (stmt.orReplace) "OR REPLACE " else ""
+    s"CREATE ${replaceStr}VIEW ${stmt.viewName} AS\n${visitStatement(stmt.query)}"
+  }
+
+  override def visitDropViewStatement(stmt: DropViewStatement): String = {
+    val ifExistsStr = if (stmt.ifExists) " IF EXISTS" else ""
+    s"DROP VIEW$ifExistsStr ${stmt.viewName}"
+  }
+
+  override def visitCreateProcedureStatement(stmt: CreateProcedureStatement): String = {
+    val paramsStr = stmt.params.map { p =>
+      val modeStr = p.mode match {
+        case InParam    => "IN"
+        case OutParam   => "OUT"
+        case InOutParam => "INOUT"
+      }
+      s"$modeStr ${p.name} ${formatDataType(p.dataType)}"
+    }.mkString(", ")
+    val bodyStr = stmt.body.map(visitStatement).mkString(";\n  ")
+    s"CREATE PROCEDURE ${stmt.name} ($paramsStr)\nBEGIN\n  $bodyStr;\nEND"
+  }
+
+  override def visitDropProcedureStatement(stmt: DropProcedureStatement): String = {
+    val ifExistsStr = if (stmt.ifExists) " IF EXISTS" else ""
+    s"DROP PROCEDURE$ifExistsStr ${stmt.name}"
+  }
+
+  override def visitCallStatement(stmt: CallStatement): String = {
+    val argsStr = stmt.arguments.map(formatExpression).mkString(", ")
+    s"CALL ${stmt.procedureName}($argsStr)"
   }
 
   // ====== 格式化辅助方法 ======
@@ -665,6 +894,37 @@ class SQLPrettyPrinter extends ASTVisitor[String] {
     case InSubqueryExpression(expression, query, negated) =>
       val notStr = if (negated) "NOT " else ""
       s"${formatExpression(expression)} ${notStr}IN (${visitStatement(query)})"
+
+    case WindowFunctionExpression(function, windowSpec) =>
+      val funcStr = formatExpression(function)
+      val overParts = new scala.collection.mutable.ListBuffer[String]()
+
+      windowSpec.partitionBy.foreach { exprs =>
+        overParts += s"PARTITION BY ${exprs.map(formatExpression).mkString(", ")}"
+      }
+
+      windowSpec.orderBy.foreach { obs =>
+        val orderByStr = obs.map { ob =>
+          s"${formatExpression(ob.expression)} ${if (ob.ascending) "ASC" else "DESC"}"
+        }.mkString(", ")
+        overParts += s"ORDER BY $orderByStr"
+      }
+
+      windowSpec.frame.foreach { frame =>
+        val frameTypeStr = frame.frameType match {
+          case RowsFrame => "ROWS"
+          case RangeFrame => "RANGE"
+        }
+        val boundsStr = frame.end match {
+          case Some(endBound) =>
+            s"BETWEEN ${formatFrameBound(frame.start)} AND ${formatFrameBound(endBound)}"
+          case None =>
+            formatFrameBound(frame.start)
+        }
+        overParts += s"$frameTypeStr $boundsStr"
+      }
+
+      s"$funcStr OVER (${overParts.mkString(" ")})"
   }
 
   private def formatOperator(op: BinaryOperator): String = op match {
@@ -697,11 +957,71 @@ class SQLPrettyPrinter extends ASTVisitor[String] {
   private def formatDataType(dt: DataType): String = dt match {
     case IntType(Some(size)) => s"INT($size)"
     case IntType(None)       => "INT"
+    case BigIntType(Some(size)) => s"BIGINT($size)"
+    case BigIntType(None)       => "BIGINT"
+    case SmallIntType(Some(size)) => s"SMALLINT($size)"
+    case SmallIntType(None)       => "SMALLINT"
     case VarcharType(size)   => s"VARCHAR($size)"
     case TextType            => "TEXT"
     case DateTimeType        => "DATETIME"
     case TimestampType       => "TIMESTAMP"
     case BooleanType         => "BOOLEAN"
+    case FloatType           => "FLOAT"
+    case DoubleType          => "DOUBLE"
+    case DecimalDataType(Some(p), Some(s)) => s"DECIMAL($p,$s)"
+    case DecimalDataType(Some(p), None)    => s"DECIMAL($p)"
+    case DecimalDataType(None, _)          => "DECIMAL"
+  }
+
+  private def formatColumnConstraints(constraints: List[ColumnConstraint]): String = {
+    if (constraints.isEmpty) return ""
+    val parts = constraints.map {
+      case NotNullConstraint       => "NOT NULL"
+      case PrimaryKeyConstraint    => "PRIMARY KEY"
+      case UniqueConstraint        => "UNIQUE"
+      case AutoIncrementConstraint => "AUTO_INCREMENT"
+      case DefaultConstraint(v)    => s"DEFAULT ${formatExpression(v)}"
+      case CheckColumnConstraint(c) => s"CHECK (${formatExpression(c)})"
+      case ReferencesConstraint(refTable, refCol) => s"REFERENCES $refTable($refCol)"
+    }
+    " " + parts.mkString(" ")
+  }
+
+  private def formatTableConstraint(tc: TableConstraint): String = {
+    val nameStr = tc.name.map(n => s"CONSTRAINT $n ").getOrElse("")
+    tc match {
+      case PrimaryKeyTableConstraint(_, cols) =>
+        s"${nameStr}PRIMARY KEY (${cols.mkString(", ")})"
+      case UniqueTableConstraint(_, cols) =>
+        s"${nameStr}UNIQUE (${cols.mkString(", ")})"
+      case ForeignKeyTableConstraint(_, cols, refTable, refCols) =>
+        s"${nameStr}FOREIGN KEY (${cols.mkString(", ")}) REFERENCES $refTable(${refCols.mkString(", ")})"
+      case CheckTableConstraint(_, condition) =>
+        s"${nameStr}CHECK (${formatExpression(condition)})"
+    }
+  }
+
+  private def formatAlterAction(action: AlterAction): String = action match {
+    case AddColumnAction(col) =>
+      val constraintStr = formatColumnConstraints(col.constraints)
+      s"ADD COLUMN ${col.name} ${formatDataType(col.dataType)}$constraintStr"
+    case DropColumnAction(name) =>
+      s"DROP COLUMN $name"
+    case ModifyColumnAction(col) =>
+      val constraintStr = formatColumnConstraints(col.constraints)
+      s"MODIFY COLUMN ${col.name} ${formatDataType(col.dataType)}$constraintStr"
+    case ChangeColumnAction(oldName, newCol) =>
+      val constraintStr = formatColumnConstraints(newCol.constraints)
+      s"CHANGE COLUMN $oldName ${newCol.name} ${formatDataType(newCol.dataType)}$constraintStr"
+    case RenameTableAction(newName) =>
+      s"RENAME TO $newName"
+    case AddConstraintAction(tc) =>
+      s"ADD ${formatTableConstraint(tc)}"
+    case DropConstraintAction(constraintType, name) =>
+      name match {
+        case Some(n) => s"DROP $constraintType $n"
+        case None    => s"DROP $constraintType"
+      }
   }
 
   private def formatCastType(castType: CastType): String = castType match {
@@ -717,6 +1037,14 @@ class SQLPrettyPrinter extends ASTVisitor[String] {
     case DateTimeCastType                    => "DATETIME"
     case IntCastType                         => "INT"
     case BooleanCastType                     => "BOOLEAN"
+  }
+
+  private def formatFrameBound(bound: FrameBound): String = bound match {
+    case UnboundedPreceding   => "UNBOUNDED PRECEDING"
+    case UnboundedFollowing   => "UNBOUNDED FOLLOWING"
+    case CurrentRowBound      => "CURRENT ROW"
+    case PrecedingBound(n)    => s"$n PRECEDING"
+    case FollowingBound(n)    => s"$n FOLLOWING"
   }
 }
 

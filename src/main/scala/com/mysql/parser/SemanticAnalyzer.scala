@@ -84,6 +84,18 @@ object SemanticAnalyzer {
       case c: CreateTableStatement => analyzeCreateTable(c, schema)
       case dt: DropTableStatement  => analyzeDropTable(dt, schema)
       case un: UnionStatement  => analyzeUnion(un, schema)
+      case w: WithStatement    => analyzeWith(w, schema)
+      case a: AlterTableStatement  => analyzeAlterTable(a, schema)
+      case ci: CreateIndexStatement => analyzeCreateIndex(ci, schema)
+      case di: DropIndexStatement  => analyzeDropIndex(di, schema)
+      case cv: CreateViewStatement => analyzeSelect(cv.query match {
+        case s: SelectStatement => s
+        case _ => return Nil
+      }, schema)
+      case _: DropViewStatement         => Nil
+      case cp: CreateProcedureStatement => cp.body.flatMap(analyze(_, schema))
+      case _: DropProcedureStatement    => Nil
+      case _: CallStatement             => Nil
     }
   }
 
@@ -299,7 +311,108 @@ object SemanticAnalyzer {
   }
 
   // ==================================
-  //  UNION 语句分析
+  //  ALTER TABLE 语句分析
+  // ==================================
+
+  private def analyzeAlterTable(stmt: AlterTableStatement, schema: DatabaseSchema): List[SemanticError] = {
+    var errors = List[SemanticError]()
+
+    // 检查表是否存在
+    if (!schema.hasTable(stmt.tableName)) {
+      errors = errors :+ SemanticError(
+        s"Table '${stmt.tableName}' does not exist",
+        SError, "TABLE"
+      )
+    } else {
+      // 表存在时，检查操作是否合法
+      schema.findTable(stmt.tableName).foreach { table =>
+        stmt.actions.foreach {
+          case AddColumnAction(col) =>
+            if (table.hasColumn(col.name)) {
+              errors = errors :+ SemanticError(
+                s"Column '${col.name}' already exists in table '${stmt.tableName}'",
+                SError, "COLUMN"
+              )
+            }
+          case DropColumnAction(colName) =>
+            if (!table.hasColumn(colName)) {
+              errors = errors :+ SemanticError(
+                s"Column '${colName}' does not exist in table '${stmt.tableName}'",
+                SError, "COLUMN"
+              )
+            }
+          case ModifyColumnAction(col) =>
+            if (!table.hasColumn(col.name)) {
+              errors = errors :+ SemanticError(
+                s"Column '${col.name}' does not exist in table '${stmt.tableName}'",
+                SError, "COLUMN"
+              )
+            }
+          case ChangeColumnAction(oldName, _) =>
+            if (!table.hasColumn(oldName)) {
+              errors = errors :+ SemanticError(
+                s"Column '${oldName}' does not exist in table '${stmt.tableName}'",
+                SError, "COLUMN"
+              )
+            }
+          case _ => // RENAME, ADD CONSTRAINT, DROP CONSTRAINT — 简单通过
+        }
+      }
+    }
+
+    errors
+  }
+
+  // ==================================
+  //  CREATE INDEX 语句分析
+  // ==================================
+
+  private def analyzeCreateIndex(stmt: CreateIndexStatement, schema: DatabaseSchema): List[SemanticError] = {
+    var errors = List[SemanticError]()
+
+    // 检查表是否存在
+    if (!schema.hasTable(stmt.tableName)) {
+      errors = errors :+ SemanticError(
+        s"Table '${stmt.tableName}' does not exist",
+        SError, "TABLE"
+      )
+    } else {
+      // 检查索引列是否存在
+      schema.findTable(stmt.tableName).foreach { table =>
+        stmt.columns.foreach { col =>
+          if (!table.hasColumn(col.name)) {
+            errors = errors :+ SemanticError(
+              s"Column '${col.name}' does not exist in table '${stmt.tableName}'",
+              SError, "COLUMN"
+            )
+          }
+        }
+      }
+    }
+
+    errors
+  }
+
+  // ==================================
+  //  DROP INDEX 语句分析
+  // ==================================
+
+  private def analyzeDropIndex(stmt: DropIndexStatement, schema: DatabaseSchema): List[SemanticError] = {
+    var errors = List[SemanticError]()
+
+    // 检查表是否存在
+    if (!schema.hasTable(stmt.tableName)) {
+      errors = errors :+ SemanticError(
+        s"Table '${stmt.tableName}' does not exist",
+        SError, "TABLE"
+      )
+    }
+
+    errors
+  }
+
+  // ==================================
+  //  集合运算语句分析（UNION / INTERSECT / EXCEPT）
   // ==================================
 
   private def analyzeUnion(stmt: UnionStatement, schema: DatabaseSchema): List[SemanticError] = {
@@ -314,11 +427,37 @@ object SemanticAnalyzer {
     val rightCount = stmt.right.columns.length
 
     if (leftCount > 0 && rightCount > 0 && leftCount != rightCount) {
+      val opName = setOperatorName(stmt.unionType)
       errors = errors :+ SemanticError(
-        s"UNION queries must have the same number of columns (left: ${leftCount}, right: ${rightCount})",
+        s"$opName queries must have the same number of columns (left: ${leftCount}, right: ${rightCount})",
         SError, "UNION"
       )
     }
+
+    errors
+  }
+
+  /** 获取集合运算符的显示名称 */
+  private def setOperatorName(ut: UnionType): String = ut match {
+    case UnionAll | UnionDistinct       => "UNION"
+    case IntersectAll | IntersectDistinct => "INTERSECT"
+    case ExceptAll | ExceptDistinct     => "EXCEPT"
+  }
+
+  // ==================================
+  //  WITH (CTE) 语句分析
+  // ==================================
+
+  private def analyzeWith(stmt: WithStatement, schema: DatabaseSchema): List[SemanticError] = {
+    var errors = List[SemanticError]()
+
+    // 分析每个 CTE 定义
+    stmt.ctes.foreach { cte =>
+      errors = errors ++ analyze(cte.query, schema)
+    }
+
+    // 分析主查询
+    errors = errors ++ analyze(stmt.query, schema)
 
     errors
   }
@@ -531,6 +670,11 @@ object SemanticAnalyzer {
       case InSubqueryExpression(expression, _, _) =>
         checkExpression(expression, scope)
 
+      case WindowFunctionExpression(function, windowSpec) =>
+        checkExpression(function, scope) ++
+          windowSpec.partitionBy.toList.flatMap(_.flatMap(e => checkExpression(e, scope))) ++
+          windowSpec.orderBy.toList.flatMap(_.flatMap(ob => checkExpression(ob.expression, scope)))
+
       // 字面量和特殊标记不需要检查
       case _: StringLiteral | _: NumberLiteral | NullLiteral | AllColumnsExpression =>
         List.empty
@@ -663,6 +807,10 @@ object SemanticAnalyzer {
       extractIdentifiers(expression) ++ values.flatMap(extractIdentifiers)
     case LikeExpression(expression, pattern, _) =>
       extractIdentifiers(expression) ++ extractIdentifiers(pattern)
+    case WindowFunctionExpression(function, windowSpec) =>
+      extractIdentifiers(function) ++
+        windowSpec.partitionBy.toList.flatMap(_.flatMap(extractIdentifiers)) ++
+        windowSpec.orderBy.toList.flatMap(_.flatMap(ob => extractIdentifiers(ob.expression)))
     case _ => List.empty
   }
 
@@ -692,6 +840,7 @@ object SemanticAnalyzer {
       extractNonAggregateIdentifiers(expression) ++ values.flatMap(extractNonAggregateIdentifiers)
     case LikeExpression(expression, pattern, _) =>
       extractNonAggregateIdentifiers(expression) ++ extractNonAggregateIdentifiers(pattern)
+    case _: WindowFunctionExpression => List.empty  // 窗口函数内的标识符不算
     case _ => List.empty
   }
 
@@ -712,6 +861,7 @@ object SemanticAnalyzer {
         elseResult.exists(containsAggregateFunction)
     case CastExpression(expression, _) => containsAggregateFunction(expression)
     case ConvertExpression(expression, _, _) => containsAggregateFunction(expression)
+    case _: WindowFunctionExpression => true  // 窗口函数表达式视为含聚合
     case _ => false
   }
 }

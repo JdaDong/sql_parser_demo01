@@ -55,9 +55,11 @@ case object THEN extends Token
 case object ELSE extends Token
 case object END extends Token
 
-// UNION 关键字
+// UNION / INTERSECT / EXCEPT 关键字
 case object UNION extends Token
 case object ALL extends Token
+case object INTERSECT extends Token
+case object EXCEPT extends Token
 
 // CAST / CONVERT 关键字
 case object CAST extends Token
@@ -77,6 +79,56 @@ case object AVG extends Token
 case object MAX extends Token
 case object MIN extends Token
 
+// 窗口函数关键字
+case object OVER extends Token
+case object PARTITION extends Token
+case object ROWS extends Token
+case object RANGE extends Token
+case object UNBOUNDED extends Token
+case object PRECEDING extends Token
+case object FOLLOWING extends Token
+case object CURRENT extends Token
+case object ROW extends Token
+
+// CTE 关键字
+case object WITH extends Token
+case object RECURSIVE extends Token
+
+// ALTER TABLE 关键字
+case object ADD extends Token
+case object COLUMN_KW extends Token
+case object MODIFY extends Token
+case object RENAME extends Token
+case object TO extends Token
+case object CHANGE extends Token
+case object IF extends Token
+
+// 约束关键字
+case object PRIMARY extends Token
+case object KEY extends Token
+case object UNIQUE extends Token
+case object FOREIGN extends Token
+case object REFERENCES extends Token
+case object CHECK extends Token
+case object DEFAULT extends Token
+case object AUTO_INCREMENT extends Token
+case object CONSTRAINT extends Token
+
+// 索引关键字
+case object INDEX extends Token
+
+// 视图关键字
+case object VIEW extends Token
+case object REPLACE extends Token
+
+// 存储过程关键字
+case object PROCEDURE extends Token
+case object CALL extends Token
+case object BEGIN_KW extends Token
+case object RETURN extends Token
+case object INOUT extends Token
+case object OUT extends Token
+
 // 数据类型
 case object INT extends Token
 case object VARCHAR extends Token
@@ -84,6 +136,10 @@ case object TEXT extends Token
 case object DATETIME extends Token
 case object TIMESTAMP extends Token
 case object BOOLEAN extends Token
+case object BIGINT extends Token
+case object SMALLINT extends Token
+case object FLOAT extends Token
+case object DOUBLE extends Token
 
 // 运算符
 case object EQUALS extends Token          // =
@@ -112,3 +168,28 @@ case class NumberToken(value: String) extends Token
 // 其他
 case object EOF extends Token
 case object WHITESPACE extends Token
+
+// ============================================================
+//  Token 位置信息
+// ============================================================
+
+/**
+ * Token 在源码中的位置
+ *
+ * @param line   行号（从 1 开始）
+ * @param column 列号（从 1 开始）
+ * @param offset 在源码字符串中的偏移量（从 0 开始）
+ */
+case class Position(line: Int, column: Int, offset: Int) {
+  override def toString: String = s"$line:$column"
+}
+
+/**
+ * 携带位置信息的 Token
+ *
+ * @param token    原始 Token
+ * @param position Token 起始位置
+ */
+case class PositionedToken(token: Token, position: Position) {
+  override def toString: String = s"$token@$position"
+}

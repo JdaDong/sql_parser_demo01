@@ -6,13 +6,37 @@ package com.mysql.parser
 object MySQLParser {
   
   /**
-   * 解析 SQL 语句
+   * 解析 SQL 语句（增强模式，错误报告包含行号/列号）
    */
   def parse(sql: String): SQLStatement = {
     val lexer = new Lexer(sql)
-    val tokens = lexer.tokenize()
-    val parser = new Parser(tokens)
+    val posTokens = lexer.tokenizeWithPositions()
+    val parser = Parser.withPositions(posTokens, sql)
     parser.parse()
+  }
+
+  /**
+   * 解析 SQL 并返回带位置的 Token 列表（用于 REPL 展示 Token 流）
+   */
+  def tokenize(sql: String): List[PositionedToken] = {
+    val lexer = new Lexer(sql)
+    lexer.tokenizeWithPositions()
+  }
+
+  /**
+   * 解析 SQL 并返回紧凑 JSON 字符串
+   */
+  def toJson(sql: String): String = {
+    val ast = parse(sql)
+    ASTJsonSerializer.toJson(ast)
+  }
+
+  /**
+   * 解析 SQL 并返回格式化 JSON 字符串（带缩进）
+   */
+  def toJsonPretty(sql: String): String = {
+    val ast = parse(sql)
+    ASTJsonSerializer.toJsonPretty(ast)
   }
 
   /**
@@ -97,25 +121,140 @@ object MySQLParser {
           printExpression(w, indent + 2)
         }
 
-      case CreateTableStatement(tableName, columns) =>
+      case CreateTableStatement(tableName, columns, constraints) =>
         println(s"${prefix}CREATE TABLE Statement:")
         println(s"${prefix}  Table: $tableName")
         println(s"${prefix}  Columns:")
         columns.foreach { col =>
-          println(s"${prefix}    ${col.name} ${printDataType(col.dataType)}")
+          val constraintStr = if (col.constraints.nonEmpty)
+            " [" + col.constraints.map(printColumnConstraint).mkString(", ") + "]"
+          else ""
+          println(s"${prefix}    ${col.name} ${printDataType(col.dataType)}$constraintStr")
+        }
+        if (constraints.nonEmpty) {
+          println(s"${prefix}  Table Constraints:")
+          constraints.foreach { tc =>
+            println(s"${prefix}    ${printTableConstraint(tc)}")
+          }
         }
 
-      case DropTableStatement(tableName) =>
-        println(s"${prefix}DROP TABLE Statement:")
+      case DropTableStatement(tableName, ifExists) =>
+        val ifExistsStr = if (ifExists) " IF EXISTS" else ""
+        println(s"${prefix}DROP TABLE$ifExistsStr Statement:")
+        println(s"${prefix}  Table: $tableName")
+
+      case AlterTableStatement(tableName, actions) =>
+        println(s"${prefix}ALTER TABLE Statement:")
+        println(s"${prefix}  Table: $tableName")
+        println(s"${prefix}  Actions:")
+        actions.foreach {
+          case AddColumnAction(col) =>
+            val constraintStr = if (col.constraints.nonEmpty)
+              " [" + col.constraints.map(printColumnConstraint).mkString(", ") + "]"
+            else ""
+            println(s"${prefix}    ADD COLUMN: ${col.name} ${printDataType(col.dataType)}$constraintStr")
+          case DropColumnAction(name) =>
+            println(s"${prefix}    DROP COLUMN: $name")
+          case ModifyColumnAction(col) =>
+            val constraintStr = if (col.constraints.nonEmpty)
+              " [" + col.constraints.map(printColumnConstraint).mkString(", ") + "]"
+            else ""
+            println(s"${prefix}    MODIFY COLUMN: ${col.name} ${printDataType(col.dataType)}$constraintStr")
+          case ChangeColumnAction(oldName, newCol) =>
+            val constraintStr = if (newCol.constraints.nonEmpty)
+              " [" + newCol.constraints.map(printColumnConstraint).mkString(", ") + "]"
+            else ""
+            println(s"${prefix}    CHANGE COLUMN: $oldName -> ${newCol.name} ${printDataType(newCol.dataType)}$constraintStr")
+          case RenameTableAction(newName) =>
+            println(s"${prefix}    RENAME TO: $newName")
+          case AddConstraintAction(tc) =>
+            println(s"${prefix}    ADD ${printTableConstraint(tc)}")
+          case DropConstraintAction(constraintType, name) =>
+            println(s"${prefix}    DROP $constraintType${name.map(n => s" $n").getOrElse("")}")
+        }
+
+      case CreateIndexStatement(indexName, tableName, columns, unique) =>
+        val uniqueStr = if (unique) "UNIQUE " else ""
+        println(s"${prefix}CREATE ${uniqueStr}INDEX Statement:")
+        println(s"${prefix}  Index: $indexName")
+        println(s"${prefix}  Table: $tableName")
+        println(s"${prefix}  Columns: ${columns.map(c => s"${c.name}${if (c.ascending) "" else " DESC"}").mkString(", ")}")
+
+      case DropIndexStatement(indexName, tableName) =>
+        println(s"${prefix}DROP INDEX Statement:")
+        println(s"${prefix}  Index: $indexName")
         println(s"${prefix}  Table: $tableName")
 
       case UnionStatement(left, right, unionType) =>
-        println(s"${prefix}UNION Statement:")
-        println(s"${prefix}  Type: ${if (unionType == UnionAll) "UNION ALL" else "UNION"}")
+        val opLabel = unionType match {
+          case UnionAll          => "UNION ALL"
+          case UnionDistinct     => "UNION"
+          case IntersectAll      => "INTERSECT ALL"
+          case IntersectDistinct => "INTERSECT"
+          case ExceptAll         => "EXCEPT ALL"
+          case ExceptDistinct    => "EXCEPT"
+        }
+        println(s"${prefix}${opLabel} Statement:")
+        println(s"${prefix}  Type: $opLabel")
         println(s"${prefix}  Left:")
         printAST(left, indent + 2)
         println(s"${prefix}  Right:")
         printAST(right, indent + 2)
+
+      case WithStatement(ctes, query, recursive) =>
+        println(s"${prefix}WITH Statement${if (recursive) " (RECURSIVE)" else ""}:")
+        ctes.foreach { cte =>
+          println(s"${prefix}  CTE: ${cte.name}")
+          printAST(cte.query, indent + 2)
+        }
+        println(s"${prefix}  Main Query:")
+        printAST(query, indent + 2)
+
+      case CreateViewStatement(viewName, query, orReplace) =>
+        val replaceStr = if (orReplace) "OR REPLACE " else ""
+        println(s"${prefix}CREATE ${replaceStr}VIEW Statement:")
+        println(s"${prefix}  View: $viewName")
+        println(s"${prefix}  Query:")
+        printAST(query, indent + 2)
+
+      case DropViewStatement(viewName, ifExists) =>
+        val ifExistsStr = if (ifExists) " IF EXISTS" else ""
+        println(s"${prefix}DROP VIEW$ifExistsStr Statement:")
+        println(s"${prefix}  View: $viewName")
+
+      case CreateProcedureStatement(name, params, body) =>
+        println(s"${prefix}CREATE PROCEDURE Statement:")
+        println(s"${prefix}  Name: $name")
+        if (params.nonEmpty) {
+          println(s"${prefix}  Parameters:")
+          params.foreach { p =>
+            val modeStr = p.mode match {
+              case InParam    => "IN"
+              case OutParam   => "OUT"
+              case InOutParam => "INOUT"
+            }
+            println(s"${prefix}    $modeStr ${p.name} ${printDataType(p.dataType)}")
+          }
+        }
+        println(s"${prefix}  Body:")
+        body.foreach(printAST(_, indent + 2))
+
+      case DropProcedureStatement(name, ifExists) =>
+        val ifExistsStr = if (ifExists) " IF EXISTS" else ""
+        println(s"${prefix}DROP PROCEDURE$ifExistsStr Statement:")
+        println(s"${prefix}  Procedure: $name")
+
+      case CallStatement(procName, args) =>
+        println(s"${prefix}CALL Statement:")
+        println(s"${prefix}  Procedure: $procName")
+        if (args.nonEmpty) {
+          println(s"${prefix}  Arguments:")
+          args.foreach { arg =>
+            print(s"${prefix}    ")
+            printExpression(arg, 0)
+            println()
+          }
+        }
     }
   }
 
@@ -244,6 +383,27 @@ object MySQLParser {
           print(s" USING $c")
         }
         print(")")
+
+      case WindowFunctionExpression(function, windowSpec) =>
+        printExpression(function, indent)
+        print(" OVER (")
+        windowSpec.partitionBy.foreach { exprs =>
+          print("PARTITION BY ")
+          exprs.zipWithIndex.foreach { case (e, i) =>
+            if (i > 0) print(", ")
+            printExpression(e, 0)
+          }
+        }
+        if (windowSpec.partitionBy.isDefined && windowSpec.orderBy.isDefined) print(" ")
+        windowSpec.orderBy.foreach { obs =>
+          print("ORDER BY ")
+          obs.zipWithIndex.foreach { case (ob, i) =>
+            if (i > 0) print(", ")
+            printExpression(ob.expression, 0)
+            print(if (ob.ascending) " ASC" else " DESC")
+          }
+        }
+        print(")")
     }
   }
 
@@ -277,11 +437,41 @@ object MySQLParser {
   private def printDataType(dataType: DataType): String = dataType match {
     case IntType(Some(size)) => s"INT($size)"
     case IntType(None) => "INT"
+    case BigIntType(Some(size)) => s"BIGINT($size)"
+    case BigIntType(None) => "BIGINT"
+    case SmallIntType(Some(size)) => s"SMALLINT($size)"
+    case SmallIntType(None) => "SMALLINT"
     case VarcharType(size) => s"VARCHAR($size)"
     case TextType => "TEXT"
     case DateTimeType => "DATETIME"
     case TimestampType => "TIMESTAMP"
     case BooleanType => "BOOLEAN"
+    case FloatType => "FLOAT"
+    case DoubleType => "DOUBLE"
+    case DecimalDataType(Some(p), Some(s)) => s"DECIMAL($p,$s)"
+    case DecimalDataType(Some(p), None) => s"DECIMAL($p)"
+    case DecimalDataType(None, _) => "DECIMAL"
+  }
+
+  private def printColumnConstraint(c: ColumnConstraint): String = c match {
+    case NotNullConstraint => "NOT NULL"
+    case PrimaryKeyConstraint => "PRIMARY KEY"
+    case UniqueConstraint => "UNIQUE"
+    case AutoIncrementConstraint => "AUTO_INCREMENT"
+    case DefaultConstraint(_) => "DEFAULT ..."
+    case CheckColumnConstraint(_) => "CHECK (...)"
+    case ReferencesConstraint(refTable, refCol) => s"REFERENCES $refTable($refCol)"
+  }
+
+  private def printTableConstraint(tc: TableConstraint): String = {
+    val nameStr = tc.name.map(n => s"CONSTRAINT $n ").getOrElse("")
+    tc match {
+      case PrimaryKeyTableConstraint(_, cols) => s"${nameStr}PRIMARY KEY (${cols.mkString(", ")})"
+      case UniqueTableConstraint(_, cols) => s"${nameStr}UNIQUE (${cols.mkString(", ")})"
+      case ForeignKeyTableConstraint(_, cols, refTable, refCols) =>
+        s"${nameStr}FOREIGN KEY (${cols.mkString(", ")}) REFERENCES $refTable(${refCols.mkString(", ")})"
+      case CheckTableConstraint(_, _) => s"${nameStr}CHECK (...)"
+    }
   }
 
   private def printCastType(castType: CastType): String = castType match {
@@ -331,9 +521,19 @@ object MySQLParser {
 
   /**
    * 主函数 - 示例用法
+   *
+   * 用法：
+   *   sbt run          — 运行示例演示
+   *   sbt "run repl"   — 启动交互式 REPL
    */
   def main(args: Array[String]): Unit = {
+    if (args.nonEmpty && args(0).toLowerCase == "repl") {
+      SQLRepl.main(args.drop(1))
+      return
+    }
+
     println("=== SQL Parser Demo01 ===\n")
+    println(s"提示: 运行 sbt \"run repl\" 启动交互式 REPL\n")
 
     // 示例 SQL 语句
     val examples = List(
